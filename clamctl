@@ -1,0 +1,1837 @@
+#!/bin/bash
+# Compatible with macOS /bin/bash 3.2; see README.md for launchd operation.
+# shellcheck disable=SC2153  # settings such as MODE are assigned by the config parser
+
+set -o pipefail
+umask 077
+
+CLAMCTL_VERSION="0.1.0"
+
+# Paths, overridable through the environment for tests.
+CLAMCTL_HOME="${CLAMCTL_HOME:-$HOME/.clamctl}"
+LOG_DIR="${CLAMCTL_LOG_DIR:-$HOME/Library/Logs/clamctl}"
+LAUNCH_AGENTS_DIR="${CLAMCTL_LAUNCH_AGENTS:-$HOME/Library/LaunchAgents}"
+LAUNCHCTL="${CLAMCTL_LAUNCHCTL:-/bin/launchctl}"
+
+CONF_FILE="$CLAMCTL_HOME/clamctl.conf"
+BIN_DIR="$CLAMCTL_HOME/bin"
+ETC_DIR="$CLAMCTL_HOME/etc"
+RUN_DIR="$CLAMCTL_HOME/run"
+STATE_DIR="$CLAMCTL_HOME/state"
+QUARANTINE_DIR="$CLAMCTL_HOME/quarantine"
+INSTALLED_SCRIPT="$BIN_DIR/clamctl"
+RUNNER="$BIN_DIR/clamctl-agent"
+RUNNER_SRC="$BIN_DIR/clamctl-agent.c"
+MANIFEST="$QUARANTINE_DIR/manifest.tsv"
+THREAT_LOG="$STATE_DIR/threats.log"
+LEDGER="$STATE_DIR/watch.ledger"
+LABEL_PREFIX="local.clamctl"
+DOMAIN="gui/$(id -u)"
+QUARANTINE_SUFFIX=".clamctl-quarantined"
+QUARANTINE_REGEX='\.clamctl-quarantined$'
+
+resolve_path() {
+    local p="$1" link dir
+    while [ -L "$p" ]; do
+        link="$(readlink "$p")"
+        case "$link" in /*) p="$link" ;; *) p="$(dirname "$p")/$link" ;; esac
+    done
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    dir="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" && p="$dir/$(basename "$p")"
+    printf '%s' "$p"
+}
+SELF_PATH="$(resolve_path "${CLAMCTL_SCRIPT:-$0}")"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    B="$(printf '\033[1m')"; G="$(printf '\033[32m')"; Y="$(printf '\033[33m')"
+    R="$(printf '\033[31m')"; D="$(printf '\033[2m')"; N="$(printf '\033[0m')"
+else
+    B=""; G=""; Y=""; R=""; D=""; N=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+bad()  { printf '%s✗%s %s\n' "$R" "$N" "$*"; }
+note() { printf '%s•%s %s\n' "$Y" "$N" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+log() {
+    [ -d "$LOG_DIR" ] || return 0
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_DIR/clamctl.log" 2>/dev/null
+}
+
+rotate_log() {
+    local size
+    [ -f "$1" ] || return 0
+    size="$(stat -f %z "$1" 2>/dev/null || echo 0)"
+    [ "$size" -gt "$2" ] && mv -f "$1" "$1.1"
+    return 0
+}
+
+rotate_logs() {
+    local f
+    rotate_log "$LOG_DIR/clamctl.log" 2000000
+    for f in "$LOG_DIR"/launchd-*.log; do [ -f "$f" ] && rotate_log "$f" 500000; done
+    return 0
+}
+
+now() { date +%s; }
+fmt_time() { date -r "$1" '+%Y-%m-%d %H:%M'; }
+fmt_duration() {
+    local s="${1:-0}"
+    if [ "$s" -ge 3600 ]; then printf '%dh %dm' $((s / 3600)) $((s % 3600 / 60))
+    elif [ "$s" -ge 60 ]; then printf '%dm %ds' $((s / 60)) $((s % 60))
+    else printf '%ds' "$s"; fi
+}
+fmt_age() {
+    local s=$(( $(now) - ${1:-0} ))
+    if [ "$s" -ge 172800 ]; then printf '%d days' $((s / 86400))
+    elif [ "$s" -ge 7200 ]; then printf '%d hours' $((s / 3600))
+    elif [ "$s" -ge 120 ]; then printf '%d minutes' $((s / 60))
+    elif [ "$s" -ge 60 ]; then printf '1 minute'
+    else printf '%d s' "$s"; fi
+}
+tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+as_escape()  { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+regex_escape() { printf '%s' "$1" | sed -e 's/[][\\.^$*+?(){}|]/\\&/g' -e 's/ /[[:space:]]/g'; }
+
+abspath() {
+    local p="$1"
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    if [ -d "$p" ]; then (cd -- "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+    else printf '%s' "$p"; fi
+}
+
+# State lives in small key=value files under state/.
+state_get() { [ -f "$STATE_DIR/$1" ] && sed -n "s/^$2=//p" "$STATE_DIR/$1" | head -1; }
+state_set() {
+    local topic="$1" tmp; shift
+    tmp="$STATE_DIR/$topic.tmp"
+    printf '%s\n' "$@" > "$tmp" && mv -f "$tmp" "$STATE_DIR/$topic"
+}
+
+detect_brew() {
+    [ -n "${BREW_PREFIX:-}" ] && return 0
+    if [ -x /opt/homebrew/bin/brew ]; then BREW_PREFIX=/opt/homebrew
+    elif [ -x /usr/local/bin/brew ]; then BREW_PREFIX=/usr/local
+    elif command -v brew >/dev/null 2>&1; then BREW_PREFIX="$(brew --prefix)"
+    else BREW_PREFIX=""; fi
+}
+
+set_clamav_paths() {
+    CLAMAV_DIR="$BREW_PREFIX/opt/clamav"
+    CLAMSCAN="$CLAMAV_DIR/bin/clamscan"
+    CLAMDSCAN="$CLAMAV_DIR/bin/clamdscan"
+    FRESHCLAM="$CLAMAV_DIR/bin/freshclam"
+    CLAMD="$CLAMAV_DIR/sbin/clamd"
+    SIGTOOL="$CLAMAV_DIR/bin/sigtool"
+}
+
+# Parse defaults before user settings; configuration values are never executed.
+default_config() {
+cat <<'EOF'
+# clamctl configuration: KEY=value or KEY=(list "with spaces"), one setting per
+# line, comments on their own lines. ~, $HOME, $BREW_PREFIX and $CLAMCTL_HOME are
+# expanded; nothing else is. Apply changes with: clamctl apply
+
+# light loads signatures per scan; daemon keeps clamd resident (about 1.5 GB RAM).
+MODE=light
+
+# Watch settled files; partial downloads are skipped.
+WATCH_DIRS=("$HOME/Downloads")
+
+# quarantine renames detections in place and removes access; report only logs and notifies.
+ACTION=quarantine
+
+# Report full-scan detections to avoid disabling applications or mail stores on false positives.
+FULL_SCAN_ACTION=report
+
+# Heuristic and PUA detections are report-only unless explicitly enabled here.
+QUARANTINE_HEURISTICS=no
+
+# Daily scan time is local; launchd runs missed calendar jobs on wake.
+SCAN_HOUR=12
+SCAN_MINUTE=30
+
+# Quick scan (daily): where new files and persistence usually land.
+QUICK_SCAN_PATHS=(
+    "$HOME/Downloads" "$HOME/Desktop" "$HOME/Documents" "$HOME/Applications"
+    "$HOME/Library/LaunchAgents" /Library/LaunchAgents /Library/LaunchDaemons
+    /private/tmp /Users/Shared
+)
+
+# Full scan: everything except EXCLUDE_DIRS below.
+FULL_SCAN_PATHS=(/)
+FULL_SCAN_EVERY_DAYS=7
+# Full scans are skipped while on battery unless yes (they are retried the next day).
+FULL_SCAN_ON_BATTERY=no
+
+# Hours between signature update checks.
+UPDATE_INTERVAL_HOURS=4
+
+# Exclude the sealed system volume, caches and cloud storage; explicit scan roots override these exclusions.
+EXCLUDE_DIRS=(
+    /System /Library/Apple /bin /sbin /usr/bin /usr/lib /usr/libexec /usr/sbin
+    /usr/share /usr/standalone /private/var/db /private/var/folders
+    /private/var/vm /dev /Volumes /Network /cores
+    "$HOME/Library/CloudStorage" "$HOME/Library/Mobile Documents"
+    "$HOME/Library/Developer/CoreSimulator" "$HOME/Library/Developer/Xcode/DerivedData"
+    "$HOME/Library/Application Support/MobileSync"
+    "$HOME/Library/Containers/com.docker.docker/Data/vms"
+)
+# Directory names skipped wherever they appear.
+EXCLUDE_NAMES=(Caches .git node_modules)
+# Your own additions, kept separate so defaults can change without merges.
+EXTRA_EXCLUDE_DIRS=()
+EXTRA_EXCLUDE_NAMES=()
+
+# Size limits. Files above MAX_FILESIZE are skipped; MAX_SCANSIZE caps how
+# much of an archive is unpacked and scanned.
+MAX_FILESIZE=400M
+MAX_SCANSIZE=1000M
+
+# Possibly unwanted applications: off by default (false positives). Example:
+# DETECT_PUA=yes and PUA_CATEGORIES=(Osx Spy RAT)
+DETECT_PUA=no
+PUA_CATEGORIES=()
+
+# Third-party Sanesecurity signatures (opt in). Adds detection of malicious
+# attachments, macros and rogue software, at the cost of more false positives.
+EXTRA_SIGNATURES=no
+
+# clamd threads in daemon mode. Two is plenty on efficiency cores.
+CLAMD_MAX_THREADS=2
+
+# macOS notifications on detections, update trouble and finished scans.
+NOTIFY=yes
+NOTIFY_CLEAN=no
+
+# A stable signing identity preserves helper grants across updates; see README "Updating".
+CODESIGN_IDENTITY=""
+
+# Signature database directory (Homebrew default).
+DATABASE_DIR="$BREW_PREFIX/var/lib/clamav"
+EOF
+}
+
+CONFIG_SCALARS=" MODE ACTION FULL_SCAN_ACTION QUARANTINE_HEURISTICS SCAN_HOUR SCAN_MINUTE FULL_SCAN_EVERY_DAYS FULL_SCAN_ON_BATTERY UPDATE_INTERVAL_HOURS MAX_FILESIZE MAX_SCANSIZE DETECT_PUA EXTRA_SIGNATURES CLAMD_MAX_THREADS NOTIFY NOTIFY_CLEAN CODESIGN_IDENTITY DATABASE_DIR "
+CONFIG_ARRAYS=" WATCH_DIRS QUICK_SCAN_PATHS FULL_SCAN_PATHS EXCLUDE_DIRS EXCLUDE_NAMES EXTRA_EXCLUDE_DIRS EXTRA_EXCLUDE_NAMES PUA_CATEGORIES "
+
+config_expand() {
+    local v="$1"
+    # shellcheck disable=SC2088  # a literal leading ~ is what is being matched
+    case "$v" in '~'|'~/'*) v="$HOME${v#\~}" ;; esac
+    v="${v//\$HOME/$HOME}"
+    v="${v//\$BREW_PREFIX/$BREW_PREFIX}"
+    v="${v//\$CLAMCTL_HOME/$CLAMCTL_HOME}"
+    printf '%s' "$v"
+}
+
+config_assign() {
+    # Only allowlisted names enter eval; values remain quoted variable expansions.
+    local key="$1" raw="$2" where="$3" tok rest
+    case "$key" in ''|*[!A-Z0-9_]*) die "$where: bad setting name '$key'" ;; esac
+    case "$raw" in
+        '('*)
+            case "$CONFIG_ARRAYS" in *" $key "*) ;; *) die "$where: $key takes a single value, not a list" ;; esac
+            case "$raw" in *')') ;; *) die "$where: list for $key must end with )" ;; esac
+            rest="${raw#(}"; rest="${rest%)}"
+            eval "$key=()"
+            while :; do
+                rest="${rest#"${rest%%[![:space:]]*}"}"
+                [ -z "$rest" ] && break
+                case "$rest" in
+                    '"'*) rest="${rest#\"}"; case "$rest" in *'"'*) ;; *) die "$where: unterminated quote in $key" ;; esac
+                          tok="${rest%%\"*}"; rest="${rest#*\"}" ;;
+                    "'"*) rest="${rest#\'}"; case "$rest" in *"'"*) ;; *) die "$where: unterminated quote in $key" ;; esac
+                          tok="${rest%%\'*}"; rest="${rest#*\'}" ;;
+                    *)    tok="${rest%%[[:space:]]*}"; rest="${rest#"$tok"}" ;;
+                esac
+                tok="$(config_expand "$tok")"
+                eval "$key+=(\"\$tok\")"
+            done
+            ;;
+        *)
+            case "$CONFIG_SCALARS" in *" $key "*) ;; *) die "$where: unknown setting $key (or it needs a list in parentheses)" ;; esac
+            case "$raw" in
+                '"'*'"') raw="${raw#\"}"; raw="${raw%\"}" ;;
+                "'"*"'") raw="${raw#\'}"; raw="${raw%\'}" ;;
+                *[[:space:]]*) die "$where: put quotes around values with spaces ($key)" ;;
+            esac
+            raw="$(config_expand "$raw")"
+            eval "$key=\"\$raw\""
+            ;;
+    esac
+}
+
+parse_config_stream() {
+    local where="$1" line stmt=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in *'"'*|*"'"*) ;; *) line="${line%%[[:space:]]#*}" ;; esac
+        line="${line%"${line##*[![:space:]]}"}"
+        if [ -n "$stmt" ]; then stmt="$stmt $line"; else stmt="$line"; fi
+        case "${stmt#*=}" in '('*) case "$stmt" in *')') ;; *) continue ;; esac ;; esac
+        case "$stmt" in *=*) ;; *) die "$where: expected KEY=value, got: $stmt" ;; esac
+        config_assign "${stmt%%=*}" "${stmt#*=}" "$where"
+        stmt=""
+    done
+    [ -n "$stmt" ] && die "$where: unterminated list: $stmt"
+    return 0
+}
+
+check_int() {
+    local v="${!1}"
+    case "$v" in ''|*[!0-9]*) die "config: $1 must be a whole number" ;; esac
+    { [ "$v" -ge "$2" ] && [ "$v" -le "$3" ]; } 2>/dev/null || die "config: $1 must be between $2 and $3"
+    printf -v "$1" '%d' "$((10#$v))"
+}
+
+validate_config() {
+    local v size_pattern='^[0-9]+[KMG]?$'
+    case "$MODE" in light|daemon) ;; *) die "config: MODE must be light or daemon" ;; esac
+    case "$ACTION" in quarantine|report) ;; *) die "config: ACTION must be quarantine or report" ;; esac
+    case "$FULL_SCAN_ACTION" in quarantine|report) ;; *) die "config: FULL_SCAN_ACTION must be quarantine or report" ;; esac
+    for v in QUARANTINE_HEURISTICS FULL_SCAN_ON_BATTERY DETECT_PUA EXTRA_SIGNATURES NOTIFY NOTIFY_CLEAN; do
+        case "${!v}" in yes|no) ;; *) die "config: $v must be yes or no" ;; esac
+    done
+    check_int SCAN_HOUR 0 23; check_int SCAN_MINUTE 0 59
+    check_int FULL_SCAN_EVERY_DAYS 1 365; check_int UPDATE_INTERVAL_HOURS 1 168; check_int CLAMD_MAX_THREADS 1 64
+    for v in MAX_FILESIZE MAX_SCANSIZE; do
+        [[ "${!v}" =~ $size_pattern ]] || die "config: $v must be a size like 400M"
+    done
+    for v in "${PUA_CATEGORIES[@]}"; do
+        case "$v" in ''|*[!a-zA-Z0-9_]*) die "config: PUA_CATEGORIES must contain category names only" ;; esac
+    done
+    for v in "$CLAMCTL_HOME" "$LOG_DIR" "$DATABASE_DIR"; do
+        case "$v" in /*) ;; *) die "configuration paths must be absolute: $v" ;; esac
+        case "$v" in *[[:space:]]*|*'"'*|*\\*) die "ClamAV configuration paths cannot contain whitespace, quotes or backslashes: $v" ;; esac
+    done
+    case "$CODESIGN_IDENTITY" in *'"'*|*\\*) die "config: CODESIGN_IDENTITY must not contain quotes or backslashes" ;; esac
+}
+
+load_config() {
+    detect_brew
+    [ -n "$BREW_PREFIX" ] || die "Homebrew is required: https://brew.sh"
+    parse_config_stream "built-in defaults" < <(default_config)
+    if [ -f "$CONF_FILE" ]; then
+        # shellcheck disable=SC2094  # tilde only formats the name for messages
+        parse_config_stream "$(tilde "$CONF_FILE")" < "$CONF_FILE"
+    fi
+    validate_config
+    set_clamav_paths
+}
+
+config_set() {
+    local key="$1" value="$2"
+    if grep -q "^$key=" "$CONF_FILE"; then
+        sed -i '' "s|^$key=.*|$key=$value|" "$CONF_FILE"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$CONF_FILE"
+    fi
+}
+
+# A native launchd entry point scopes TCC attribution; user-writable dependencies remain trusted.
+runner_source() {
+cat <<'EOF'
+#include <CommonCrypto/CommonDigest.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pwd.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifndef SCRIPT_PATH
+#error "build with -DSCRIPT_PATH -DSCRIPT_SHA256 -DCLAMCTL_HOME_DIR -DCLAMCTL_LOG_DIR"
+#endif
+
+static pid_t child = 0;
+
+static void forward(int sig) {
+    if (child > 0) kill(child, sig);
+}
+
+static int write_all(int fd, const unsigned char *buf, size_t len) {
+    while (len > 0) {
+        ssize_t n = write(fd, buf, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return 0;
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 1;
+}
+
+static int read_verified_script(unsigned char *script) {
+    unsigned char extra, digest[CC_SHA256_DIGEST_LENGTH];
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    ssize_t n;
+    size_t len = 0;
+    int fd = open(SCRIPT_PATH, O_RDONLY);
+    if (fd < 0) return 0;
+    while (len < SCRIPT_SIZE && (n = read(fd, script + len, SCRIPT_SIZE - len)) > 0) {
+        len += (size_t)n;
+    }
+    n = read(fd, &extra, 1);
+    close(fd);
+    if (len != SCRIPT_SIZE || n != 0) return 0;
+    CC_SHA256(script, SCRIPT_SIZE, digest);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+    return strcmp(hex, SCRIPT_SHA256) == 0;
+}
+
+static int allowed_args(int argc, char **argv) {
+    if (argc < 2) return 0;
+    if (strcmp(argv[1], "scan") == 0) return 1;
+    if (strcmp(argv[1], "scan-new") == 0) return argc == 2;
+    if (strcmp(argv[1], "update") == 0) return argc == 2 || (argc == 3 && strcmp(argv[2], "--scheduled") == 0);
+    if (strcmp(argv[1], "probe") == 0) return argc == 3 && strcmp(argv[2], CLAMCTL_HOME_DIR "/state/probe.result") == 0;
+    return 0;
+}
+
+static void keep(char **env, int *n, const char *name) {
+    const char *v = getenv(name);
+    if (v && *n < 30) {
+        size_t len = strlen(name) + strlen(v) + 2;
+        char *e = malloc(len);
+        if (e) { snprintf(e, len, "%s=%s", name, v); env[(*n)++] = e; }
+    }
+}
+
+int main(int argc, char **argv) {
+    unsigned char *script;
+    int script_pipe[2];
+    if (!allowed_args(argc, argv)) {
+        fprintf(stderr, "usage: clamctl-agent update|scan|scan-new|probe [args]\n");
+        return 64;
+    }
+    script = malloc(SCRIPT_SIZE);
+    if (!script) return 71;
+    if (!read_verified_script(script)) {
+        fprintf(stderr, "clamctl-agent: %s is missing or has changed; run: clamctl apply\n", SCRIPT_PATH);
+        return 78;
+    }
+    if (pipe(script_pipe) != 0) return 71;
+    char fdpath[32];
+    snprintf(fdpath, sizeof fdpath, "/dev/fd/%d", script_pipe[0]);
+
+    if (setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
+                      IOPOL_MATERIALIZE_DATALESS_FILES_OFF) != 0) {
+        perror("clamctl-agent: cannot disable cloud file materialisation");
+        return 71;
+    }
+
+    /* Fresh environment: PATH, HOME and the clamctl locations are fixed here. */
+    char *env[40];
+    int n = 0;
+    struct passwd *pw = getpwuid(getuid());
+    static char home[1100], user[300];
+    snprintf(home, sizeof home, "HOME=%s", pw && pw->pw_dir ? pw->pw_dir : "/");
+    snprintf(user, sizeof user, "USER=%s", pw && pw->pw_name ? pw->pw_name : "unknown");
+    env[n++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+    env[n++] = home;
+    env[n++] = user;
+    env[n++] = "CLAMCTL_UNDER_RUNNER=1";
+    env[n++] = "CLAMCTL_HOME=" CLAMCTL_HOME_DIR;
+    env[n++] = "CLAMCTL_LOG_DIR=" CLAMCTL_LOG_DIR;
+    env[n++] = "CLAMCTL_SCRIPT=" SCRIPT_PATH;
+    const char *tmp = getenv("TMPDIR");
+    if (tmp && tmp[0] == '/') keep(env, &n, "TMPDIR");
+    keep(env, &n, "LANG"); keep(env, &n, "LC_ALL"); keep(env, &n, "TERM");
+    keep(env, &n, "NO_COLOR"); keep(env, &n, "CLAMCTL_NOTIFY");
+    env[n] = NULL;
+
+    char **args = calloc((size_t)argc + 2, sizeof(char *));
+    if (!args) return 71;
+    args[0] = "/bin/bash";
+    args[1] = fdpath;
+    for (int i = 1; i < argc; i++) args[i + 1] = argv[i];
+    args[argc + 1] = NULL;
+
+    signal(SIGTERM, forward);
+    signal(SIGINT, forward);
+    signal(SIGHUP, forward);
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, script_pipe[1]) != 0) return 71;
+    int rc = posix_spawn(&child, "/bin/bash", &actions, NULL, args, env);
+    posix_spawn_file_actions_destroy(&actions);
+    close(script_pipe[0]);
+    if (rc != 0) {
+        close(script_pipe[1]);
+        free(script);
+        fprintf(stderr, "clamctl-agent: cannot start /bin/bash: %s\n", strerror(rc));
+        return 71;
+    }
+    signal(SIGPIPE, SIG_IGN);
+    int written = write_all(script_pipe[1], script, SCRIPT_SIZE);
+    close(script_pipe[1]);
+    free(script);
+    int status;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return 71;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status) ? WEXITSTATUS(status) : (written ? 0 : 71);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 70;
+}
+EOF
+}
+
+runner_stamp() {
+    printf '%s %s %s %s %s\n' "$(shasum -a 256 "$INSTALLED_SCRIPT" | cut -d' ' -f1)" "$CLAMCTL_HOME" "$LOG_DIR" "$(runner_source | shasum -a 256 | cut -d' ' -f1)" "${CODESIGN_IDENTITY:-adhoc}"
+}
+
+runner_signed() {
+    codesign -dv "$RUNNER" 2>&1 | grep -q '^Authority='
+}
+
+build_runner() {
+    local stamp sha p
+    for p in "$INSTALLED_SCRIPT" "$CLAMCTL_HOME" "$LOG_DIR"; do
+        case "$p" in *'"'*|*\\*) die "paths with quotes or backslashes are not supported: $p" ;; esac
+    done
+    stamp="$(runner_stamp)"
+    if [ -x "$RUNNER" ] && [ "$(cat "$RUNNER.stamp" 2>/dev/null)" = "$stamp" ]; then return 0; fi
+    xcode-select -p >/dev/null 2>&1 || die "Xcode Command Line Tools are required to build the launchd helper: xcode-select --install"
+    sha="${stamp%% *}"
+    runner_source > "$RUNNER_SRC"
+    if ! cc -O2 -Wall -Wextra -Wno-deprecated-declarations \
+            -DSCRIPT_PATH="\"$INSTALLED_SCRIPT\"" -DSCRIPT_SHA256="\"$sha\"" -DSCRIPT_SIZE="$(wc -c < "$INSTALLED_SCRIPT" | tr -d ' ')" \
+            -DCLAMCTL_HOME_DIR="\"$CLAMCTL_HOME\"" -DCLAMCTL_LOG_DIR="\"$LOG_DIR\"" \
+            -o "$RUNNER.new" "$RUNNER_SRC"; then
+        rm -f "$RUNNER.new"
+        die "could not compile $RUNNER_SRC"
+    fi
+    if [ -n "$CODESIGN_IDENTITY" ]; then
+        if ! codesign --force --sign "$CODESIGN_IDENTITY" --identifier clamctl-agent "$RUNNER.new" 2>"$RUNNER.codesign.log"; then
+            rm -f "$RUNNER.new"
+            die "codesign failed for identity '$CODESIGN_IDENTITY': $(tr '\n' ' ' < "$RUNNER.codesign.log"). Create the certificate in Keychain Access (see README) or clear CODESIGN_IDENTITY"
+        fi
+        rm -f "$RUNNER.codesign.log"
+    else
+        # Intel builds come out unsigned; an ad-hoc signature gives TCC a stable identity there too.
+        codesign --force --sign - --identifier clamctl-agent "$RUNNER.new" 2>/dev/null || true
+    fi
+    mv -f "$RUNNER.new" "$RUNNER" || die "could not install the helper"
+    printf '%s\n' "$stamp" > "$RUNNER.stamp" || die "could not record the helper version"
+    log "built $RUNNER"
+    RUNNER_REBUILT=1
+}
+
+runner_usable() {
+    [ -x "$RUNNER" ] && [ "$(cat "$RUNNER.stamp" 2>/dev/null)" = "$(runner_stamp)" ] && cmp -s "$SELF_PATH" "$INSTALLED_SCRIPT"
+}
+
+# Manual scans re-enter through the helper so the dataless-file policy applies
+# in the Terminal too; TCC attribution stays with the Terminal.
+ensure_runner_context() {
+    if [ -z "${CLAMCTL_UNDER_RUNNER:-}" ] && [ -z "${CLAMCTL_NO_RUNNER:-}" ] && runner_usable; then
+        exec "$RUNNER" "$@"
+    fi
+}
+
+exclude_regexes() {
+    # Prints one regex per line. Arguments are scan roots: an excluded directory
+    # that contains a root is skipped, so explicit paths are always scanned.
+    local d n r skip
+    for d in "${EXCLUDE_DIRS[@]}" "${EXTRA_EXCLUDE_DIRS[@]}"; do
+        [ -n "$d" ] || continue
+        d="${d%/}"; skip=""
+        for r in "$@"; do case "$r" in "$d"|"$d"/*) skip=1 ;; esac; done
+        [ -n "$skip" ] && continue
+        printf '^%s(/|$)\n' "$(regex_escape "$d")"
+    done
+    for n in "${EXCLUDE_NAMES[@]}" "${EXTRA_EXCLUDE_NAMES[@]}"; do
+        [ -n "$n" ] || continue
+        skip=""
+        for r in "$@"; do case "$r" in *"/$n"|*"/$n/"*) skip=1 ;; esac; done
+        [ -n "$skip" ] && continue
+        printf '/%s(/|$)\n' "$(regex_escape "$n")"
+    done
+    printf '%s\n' "$QUARANTINE_REGEX"
+}
+
+write_clamd_conf() {
+    # $1 output file; remaining arguments are scan roots for exclude_regexes.
+    local f="$1" re cat; shift
+    {
+        printf '# Generated by clamctl; edit ~/.clamctl/clamctl.conf instead.\n'
+        printf 'LogFile %s/clamd.log\nLogTime yes\nLogRotate yes\nLogFileMaxSize 5M\n' "$LOG_DIR"
+        printf 'PidFile %s/clamd.pid\nDatabaseDirectory %s\n' "$RUN_DIR" "$DATABASE_DIR"
+        printf 'LocalSocket %s/clamd.sock\nLocalSocketMode 600\nFixStaleSocket yes\n' "$RUN_DIR"
+        printf 'MaxThreads %s\nMaxConnectionQueueLength 30\nIdleTimeout 60\nReadTimeout 300\nSelfCheck 3600\n' "$CLAMD_MAX_THREADS"
+        printf 'ConcurrentDatabaseReload no\n'
+        printf 'MaxScanSize %s\nMaxFileSize %s\nMaxDirectoryRecursion 30\n' "$MAX_SCANSIZE" "$MAX_FILESIZE"
+        printf 'FollowDirectorySymlinks no\nFollowFileSymlinks yes\nCrossFilesystems yes\n'
+        printf 'Bytecode yes\n'
+        if [ "$DETECT_PUA" = yes ]; then
+            printf 'DetectPUA yes\n'
+            for cat in "${PUA_CATEGORIES[@]}"; do [ -n "$cat" ] && printf 'IncludePUA %s\n' "$cat"; done
+        fi
+        while IFS= read -r re; do printf 'ExcludePath %s\n' "$re"; done < <(exclude_regexes "$@")
+    } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+write_freshclam_conf() {
+    local f="$ETC_DIR/freshclam.conf"
+    {
+        printf '# Generated by clamctl; edit ~/.clamctl/clamctl.conf instead.\n'
+        printf 'DatabaseDirectory %s\nUpdateLogFile %s/freshclam.log\nLogTime yes\nLogRotate yes\nLogFileMaxSize 2M\n' "$DATABASE_DIR" "$LOG_DIR"
+        printf 'DatabaseMirror database.clamav.net\nScriptedUpdates yes\nTestDatabases yes\nBytecode yes\n'
+        # The receive timeout covers a whole download; the first fetch is about 300 MB.
+        printf 'ConnectTimeout 60\nReceiveTimeout 1800\n'
+        [ "$MODE" = daemon ] && printf 'NotifyClamd %s/clamd.conf\n' "$ETC_DIR"
+        if [ "$EXTRA_SIGNATURES" = yes ]; then
+            # Sanesecurity asks freshclam users to fetch from a mirror, not sanesecurity.net.
+            printf '%s\n' \
+                'DatabaseCustomURL https://ftp.swin.edu.au/sanesecurity/sanesecurity.ftm' \
+                'DatabaseCustomURL https://ftp.swin.edu.au/sanesecurity/sigwhitelist.ign2' \
+                'DatabaseCustomURL https://ftp.swin.edu.au/sanesecurity/rogue.hdb' \
+                'DatabaseCustomURL https://ftp.swin.edu.au/sanesecurity/badmacro.ndb' \
+                'DatabaseCustomURL https://ftp.swin.edu.au/sanesecurity/foxhole_filename.cdb' \
+                'DatabaseCustomURL https://ftp.swin.edu.au/sanesecurity/foxhole_generic.cdb' \
+                'DatabaseCustomURL https://ftp.swin.edu.au/sanesecurity/malwarehash.hsb'
+        fi
+    } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+plist_path() { printf '%s/%s.%s.plist' "$LAUNCH_AGENTS_DIR" "$LABEL_PREFIX" "$1"; }
+label_of() { printf '%s.%s' "$LABEL_PREFIX" "$1"; }
+
+plist_common_block() {
+    cat <<EOF
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityIO</key><true/>
+    <key>LowPriorityBackgroundIO</key><true/>
+    <key>Nice</key><integer>10</integer>
+    <key>StandardOutPath</key><string>$(xml_escape "$LOG_DIR/launchd-$1.log")</string>
+    <key>StandardErrorPath</key><string>$(xml_escape "$LOG_DIR/launchd-$1.log")</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+EOF
+    [ -n "${CLAMCTL_NOTIFY:-}" ] && printf '        <key>CLAMCTL_NOTIFY</key><string>%s</string>\n' "$(xml_escape "$CLAMCTL_NOTIFY")"
+    printf '    </dict>\n'
+}
+
+plist_runner_args() {
+    local a
+    printf '    <key>ProgramArguments</key>\n    <array>\n'
+    printf '        <string>%s</string>\n' "$(xml_escape "$RUNNER")"
+    for a in "$@"; do printf '        <string>%s</string>\n' "$(xml_escape "$a")"; done
+    printf '    </array>\n'
+}
+
+plist_open() {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n'
+    printf '    <key>Label</key><string>%s</string>\n' "$(label_of "$1")"
+}
+plist_close() { printf '</dict>\n</plist>\n'; }
+
+write_plist_update() {
+    {
+        plist_open update
+        plist_runner_args update --scheduled
+        printf '    <key>StartInterval</key><integer>%d</integer>\n' $((UPDATE_INTERVAL_HOURS * 3600))
+        printf '    <key>RunAtLoad</key><true/>\n'
+        plist_common_block update
+        plist_close
+    } > "$(plist_path update)"
+}
+
+write_plist_scan() {
+    {
+        plist_open scan
+        plist_runner_args scan --auto
+        printf '    <key>StartCalendarInterval</key>\n    <dict>\n        <key>Hour</key><integer>%d</integer>\n        <key>Minute</key><integer>%d</integer>\n    </dict>\n' "$SCAN_HOUR" "$SCAN_MINUTE"
+        printf '    <key>RunAtLoad</key><false/>\n'
+        plist_common_block scan
+        plist_close
+    } > "$(plist_path scan)"
+}
+
+write_plist_watch() {
+    local d throttle=15
+    [ "$MODE" = light ] && throttle=60
+    {
+        plist_open watch
+        plist_runner_args scan-new
+        printf '    <key>WatchPaths</key>\n    <array>\n'
+        for d in "${WATCH_DIRS[@]}"; do printf '        <string>%s</string>\n' "$(xml_escape "$d")"; done
+        printf '    </array>\n'
+        printf '    <key>ThrottleInterval</key><integer>%d</integer>\n' "$throttle"
+        printf '    <key>StartInterval</key><integer>300</integer>\n'
+        printf '    <key>RunAtLoad</key><true/>\n'
+        plist_common_block watch
+        plist_close
+    } > "$(plist_path watch)"
+}
+
+write_plist_clamd() {
+    {
+        plist_open clamd
+        printf '    <key>ProgramArguments</key>\n    <array>\n        <string>%s</string>\n        <string>--foreground</string>\n        <string>--config-file=%s</string>\n    </array>\n' \
+            "$(xml_escape "$CLAMD")" "$(xml_escape "$ETC_DIR/clamd.conf")"
+        printf '    <key>RunAtLoad</key><true/>\n    <key>KeepAlive</key><true/>\n    <key>ThrottleInterval</key><integer>30</integer>\n'
+        plist_common_block clamd
+        plist_close
+    } > "$(plist_path clamd)"
+}
+
+agent_loaded() { "$LAUNCHCTL" print "$DOMAIN/$(label_of "$1")" >/dev/null 2>&1; }
+
+agent_wait_gone() {
+    # launchd finishes a bootout asynchronously; wait for the service to disappear.
+    local i=0
+    [ "$LAUNCHCTL" = /bin/launchctl ] || return 0
+    while [ $i -lt 10 ] && agent_loaded "$1"; do sleep 1; i=$((i + 1)); done
+}
+
+agent_load() {
+    local plist attempt=0; plist="$(plist_path "$1")"
+    "$LAUNCHCTL" bootout "$DOMAIN/$(label_of "$1")" >/dev/null 2>&1
+    agent_wait_gone "$1"
+    "$LAUNCHCTL" enable "$DOMAIN/$(label_of "$1")" >/dev/null 2>&1
+    until "$LAUNCHCTL" bootstrap "$DOMAIN" "$plist" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        if [ "$LAUNCHCTL" != /bin/launchctl ] || [ "$attempt" -ge 5 ]; then
+            warn "launchctl could not load $(basename "$plist")"
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+agent_unload() {
+    "$LAUNCHCTL" bootout "$DOMAIN/$(label_of "$1")" >/dev/null 2>&1
+    agent_wait_gone "$1"
+    rm -f "$(plist_path "$1")"
+    return 0
+}
+
+agent_last_exit() {
+    "$LAUNCHCTL" print "$DOMAIN/$(label_of "$1")" 2>/dev/null | sed -n 's/^[[:space:]]*last exit code = //p' | head -1
+}
+
+clamd_alive() {
+    [ -S "$RUN_DIR/clamd.sock" ] || return 1
+    "$CLAMDSCAN" --config-file="$ETC_DIR/clamd.conf" --ping 1 >/dev/null 2>&1
+}
+
+clamd_wait() {
+    local i=0
+    while [ $i -lt "${1:-30}" ]; do
+        clamd_alive && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+notify() {
+    [ "$NOTIFY" = yes ] || return 0
+    [ "${CLAMCTL_NOTIFY:-yes}" = no ] && return 0
+    local script
+    script="display notification \"$(as_escape "$2")\" with title \"ClamAV\" subtitle \"$(as_escape "$1")\""
+    [ -n "$3" ] && script="$script sound name \"$3\""
+    /usr/bin/osascript -e "$script" >/dev/null 2>&1 || true
+}
+
+on_battery() { pmset -g batt 2>/dev/null | head -1 | grep -q "Battery Power"; }
+
+paused_until() { state_get pause until; }
+is_paused() {
+    local until; until="$(paused_until)"
+    [ -n "$until" ] || return 1
+    if [ "$until" = forever ] || [ "$until" -gt "$(now)" ]; then return 0; fi
+    rm -f "$STATE_DIR/pause"
+    return 1
+}
+
+# shellcheck disable=SC2012,SC2086
+db_file() { ls -t "$DATABASE_DIR"/$1.c[lv]d 2>/dev/null | head -1; }
+db_present() {
+    local m d
+    m="$(db_file main)"; d="$(db_file daily)"
+    [ -n "$m" ] && [ -s "$m" ] && [ -n "$d" ] && [ -s "$d" ]
+}
+db_version_of() {
+    local f; f="$(db_file "$1")"
+    [ -n "$f" ] && "$SIGTOOL" --info="$f" 2>/dev/null | sed -n 's/^Version: //p'
+}
+db_mtime() { local f; f="$(db_file daily)"; [ -n "$f" ] && stat -f %m "$f"; }
+
+engine_outdated() {
+    # freshclam warns when the ClamAV engine itself is behind; look at its last run only.
+    [ -f "$LOG_DIR/freshclam.log" ] || return 1
+    awk '/ClamAV update process started/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$LOG_DIR/freshclam.log" | grep -q 'OUTDATED'
+}
+
+acquire_lock() {
+    mkdir -p "$RUN_DIR/scan.lock" || return 1
+    /usr/bin/shlock -f "$RUN_DIR/scan.lock/pid" -p $$ || return 1
+    LOCKED=1
+}
+release_lock() {
+    if [ -n "${LOCKED:-}" ] && [ "$(cat "$RUN_DIR/scan.lock/pid" 2>/dev/null)" = "$$" ]; then
+        rm -f "$RUN_DIR/scan.lock/pid"
+        # A watched-folder run that met the lock gave up and left a marker; let it look again now.
+        if [ -f "$STATE_DIR/watch.pending" ] && [ "${LOCK_KICK_WATCH:-yes}" = yes ]; then
+            rm -f "$STATE_DIR/watch.pending"
+            "$LAUNCHCTL" kickstart "$DOMAIN/$(label_of watch)" >/dev/null 2>&1
+        fi
+    fi
+    LOCKED=""
+    return 0
+}
+acquire_lock_wait() {
+    # Waits up to $1 seconds for the lock, which a watched-folder run holds for a few seconds at a time.
+    local i=0
+    until acquire_lock; do
+        [ "$i" -ge "$1" ] && return 1
+        [ "$i" -eq 2 ] && [ -t 1 ] && say "${D}Waiting for another scan to finish...${N}"
+        sleep 1; i=$((i + 1))
+    done
+}
+scan_running() {
+    local pid; pid="$(cat "$RUN_DIR/scan.lock/pid" 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null
+}
+
+running_scan() {
+    # Prints "kind start-time pid" while a scan is in progress.
+    local pid; pid="$(state_get running pid)"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s %s %s' "$(state_get running kind)" "$(state_get running time)" "$pid"
+}
+
+stop_scan() {
+    local info kind pid pgid i=0
+    info="$(running_scan)" || { say "No scan is running."; return 0; }
+    kind="${info%% *}"; pid="${info##* }"
+    # The scanner is a child of the script, so signal the whole process group when it is not our own.
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [ "$pgid" = "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" ] && pgid=""
+    if [ -n "$pgid" ]; then kill -TERM -- "-$pgid" 2>/dev/null; else pkill -TERM -P "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null; fi
+    while [ $i -lt 15 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+    kill -0 "$pid" 2>/dev/null && die "the $kind scan (pid $pid) did not stop"
+    rm -f "$STATE_DIR/running"
+    # A stopped scan counts as today's run, so the catch-up logic does not restart it in five minutes.
+    state_set stopped "time=$(now)" "kind=$kind"
+    log "scan $kind stopped by the user"
+    ok "Stopped the $kind scan"
+}
+
+daily_scan_overdue() {
+    # True when no quick or full scan has run (or been stopped) for 25 hours, counted from installation at first.
+    local t last; last="$(state_get installed time)"
+    for t in "$(state_get last_quick time)" "$(state_get last_full time)" "$(state_get stopped time)"; do
+        [ -n "$t" ] && [ "$t" -gt "${last:-0}" ] && last="$t"
+    done
+    [ -n "$last" ] && [ $(( $(now) - last )) -ge 90000 ]
+}
+
+build_scan_cmd() {
+    # Sets SCAN_CMD and SCAN_ENGINE; arguments are the scan roots for exclusions.
+    local re cat
+    SCAN_ENGINE=clamscan
+    SCAN_TMP_CONF=""
+    if [ "$MODE" = daemon ]; then
+        if clamd_alive; then SCAN_ENGINE=clamdscan; else log "clamd not responding, falling back to clamscan"; fi
+    fi
+    if [ "$SCAN_ENGINE" = clamdscan ]; then
+        # clamdscan applies ExcludePath itself while walking directories with --fdpass.
+        SCAN_TMP_CONF="$RUN_DIR/clamdscan.$$.conf"
+        write_clamd_conf "$SCAN_TMP_CONF" "$@"
+        SCAN_CMD=("$CLAMDSCAN" --config-file="$SCAN_TMP_CONF" --fdpass --multiscan)
+    else
+        SCAN_CMD=("$CLAMSCAN" --recursive --stdout --database="$DATABASE_DIR"
+                  --max-filesize="$MAX_FILESIZE" --max-scansize="$MAX_SCANSIZE"
+                  --follow-dir-symlinks=1 --follow-file-symlinks=1 --exclude="$QUARANTINE_REGEX")
+        if [ "$DETECT_PUA" = yes ]; then
+            SCAN_CMD+=(--detect-pua)
+            for cat in "${PUA_CATEGORIES[@]}"; do [ -n "$cat" ] && SCAN_CMD+=(--include-pua="$cat"); done
+        fi
+        while IFS= read -r re; do
+            [ "$re" = "$QUARANTINE_REGEX" ] || SCAN_CMD+=(--exclude-dir="$re")
+        done < <(exclude_regexes "$@")
+    fi
+}
+
+priority_prefix() {
+    # low: background QoS (efficiency cores, throttled I/O); normal: utility QoS.
+    PRI_CMD=()
+    [ -x /usr/sbin/taskpolicy ] || return 0
+    case "$PRIORITY" in
+        low) PRI_CMD=(/usr/sbin/taskpolicy -b /usr/bin/nice -n 19) ;;
+        normal) PRI_CMD=(/usr/sbin/taskpolicy -c utility) ;;
+    esac
+}
+
+run_scanner() {
+    # $1 output file; the rest are scanner arguments. Per-file OK lines are counted and dropped.
+    local out="$1" pipeline_status; shift
+    priority_prefix
+    "${PRI_CMD[@]}" "${SCAN_CMD[@]}" "$@" 2>&1 | awk '
+        /: OK$/            { ok++; next }
+        /: Empty file$/    { ok++; next }
+        /: Excluded$/      { excluded++; next }
+        /: Symbolic link$/ { next }
+        /^$/               { next }
+        / FOUND$/          { found++; print; next }
+        { print }
+        END { printf "CLAMCTL_COUNTS ok=%d found=%d excluded=%d\n", ok, found, excluded }
+    ' > "$out"
+    pipeline_status=("${PIPESTATUS[@]}")
+    SCAN_EXIT="${pipeline_status[0]}"
+    [ "${pipeline_status[1]}" = 0 ] || SCAN_EXIT=2
+}
+
+record_threat() {
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$2" "$3" "$4" >> "$THREAT_LOG"
+    log "threat: $2 in $4 ($3)"
+}
+
+scan_paths() {
+    # $1 kind, $2 action, optional --file-list=FILE, then scan roots.
+    # Returns 0 clean, 1 threats found, 2 scan did not complete.
+    local kind="$1" action="$2" scan_args=(); shift 2
+    case "${1:-}" in --file-list=*) scan_args=("$1"); shift ;; *) scan_args=("$@") ;; esac
+    local out="$LOG_DIR/scan-$kind.log" start end scanned found errors denied completed=no line path sig id status heuristic
+    local threats=0 quarantined=0 reported=0 failed=0
+    mkdir -p "$LOG_DIR"
+    rotate_logs
+    rotate_log "$out" 1000000
+    build_scan_cmd "$@"
+    start="$(now)"
+    state_set running "kind=$kind" "time=$start" "pid=$$"
+    log "scan $kind started ($SCAN_ENGINE, priority $PRIORITY): $*"
+    run_scanner "$out" "${scan_args[@]}"
+    end="$(now)"
+    [ -n "$SCAN_TMP_CONF" ] && rm -f "$SCAN_TMP_CONF"
+    scanned="$(sed -n 's/^CLAMCTL_COUNTS ok=\([0-9]*\).*/\1/p' "$out")"; scanned="${scanned:-0}"
+    found="$(sed -n 's/^CLAMCTL_COUNTS .*found=\([0-9]*\).*/\1/p' "$out")"; found="${found:-0}"
+    errors="$(grep -c -E 'ERROR|WARNING|Can.t (open|access)|Permission denied|Operation not permitted|Access denied' "$out")"
+    denied="$(grep -c 'Operation not permitted' "$out")"
+    scanned=$((scanned + found))
+    case "$SCAN_EXIT" in 0|1) completed=yes ;; esac
+    # clamscan happily reports "clean" with an unreadable database; treat that as a failed scan.
+    if grep -q '^Known viruses: 0$' "$out"; then
+        completed=no
+        log "scan $kind: no signatures were loaded from $DATABASE_DIR"
+    fi
+
+    while IFS= read -r line; do
+        path="${line%: *}"
+        sig="${line##*: }"; sig="${sig% FOUND}"
+        threats=$((threats + 1))
+        case "$sig" in Heuristics.*|PUA.*) heuristic=yes ;; *) heuristic=no ;; esac
+        status=reported
+        if [ "$action" = quarantine ] && { [ "$heuristic" = no ] || [ "$QUARANTINE_HEURISTICS" = yes ]; }; then
+            if id="$(quarantine_file "$path" "$sig")"; then
+                status="quarantined:$id"; quarantined=$((quarantined + 1))
+            else
+                status="quarantine-failed"; failed=$((failed + 1))
+            fi
+        else
+            reported=$((reported + 1))
+        fi
+        record_threat "$kind" "$sig" "$status" "$path"
+    done < <(grep ' FOUND$' "$out")
+
+    SCAN_RESULT_SCANNED="$scanned"; SCAN_RESULT_THREATS="$threats"; SCAN_RESULT_QUARANTINED="$quarantined"
+    SCAN_RESULT_REPORTED="$reported"; SCAN_RESULT_FAILED="$failed"; SCAN_RESULT_ERRORS="$errors"
+    SCAN_RESULT_DENIED="$denied"; SCAN_RESULT_DURATION=$((end - start)); SCAN_RESULT_COMPLETED="$completed"
+    SCAN_RESULT_LOG="$out"
+
+    if [ "$completed" = yes ]; then
+        [ "$threats" -gt 0 ] && status=threats || status=clean
+    else
+        status=failed
+    fi
+    case "$kind" in
+        quick|full|manual) state_set "last_$kind" "time=$end" "status=$status" "scanned=$scanned" "threats=$threats" "errors=$errors" "denied=$denied" "duration=$((end - start))" ;;
+        watch) state_set last_watch "time=$end" "status=$status" "scanned=$scanned" "threats=$threats" ;;
+    esac
+    log "scan $kind finished: $status, $scanned files, $threats threats, $errors errors, $(fmt_duration $((end - start)))"
+    rm -f "$STATE_DIR/running"
+
+    if [ "$threats" -gt 0 ]; then
+        if [ "$quarantined" -gt 0 ] && [ "$threats" -eq 1 ]; then
+            notify "Threat quarantined" "$(basename "$path"): $sig" Basso
+        elif [ "$quarantined" -gt 0 ]; then
+            notify "$threats threats found" "$quarantined quarantined. Review with: clamctl threats" Basso
+        else
+            notify "$threats threats found" "Not quarantined. Review with: clamctl threats" Basso
+        fi
+    fi
+    if [ "$completed" != yes ]; then
+        notify "Scan failed" "The $kind scan did not complete. See: clamctl log scan"
+        return 2
+    fi
+    [ "$threats" -gt 0 ] && return 1
+    [ "$NOTIFY_CLEAN" = yes ] && [ "$kind" != watch ] && notify "Scan finished" "$kind scan: $scanned files, no threats"
+    return 0
+}
+
+print_scan_summary() {
+    local label
+    case "$SCAN_RESULT_COMPLETED:$SCAN_RESULT_THREATS" in
+        yes:0) label="${G}clean${N}" ;;
+        yes:*) label="${R}$SCAN_RESULT_THREATS threat(s)${N}" ;;
+        *) label="${R}did not complete${N}" ;;
+    esac
+    say ""
+    say "${B}Scan finished:${N} $label"
+    printf '  %-16s %s\n' "Files scanned" "$SCAN_RESULT_SCANNED"
+    [ "$SCAN_RESULT_THREATS" -gt 0 ] && printf '  %-16s %s quarantined, %s reported only, %s could not be quarantined\n' "Threats" "$SCAN_RESULT_QUARANTINED" "$SCAN_RESULT_REPORTED" "$SCAN_RESULT_FAILED"
+    if [ "$SCAN_RESULT_DENIED" -gt 0 ]; then
+        printf '  %-16s %s (%s not permitted: see clamctl fda)\n' "Errors" "$SCAN_RESULT_ERRORS" "$SCAN_RESULT_DENIED"
+    else
+        printf '  %-16s %s\n' "Errors" "$SCAN_RESULT_ERRORS"
+    fi
+    printf '  %-16s %s\n' "Duration" "$(fmt_duration "$SCAN_RESULT_DURATION")"
+    printf '  %-16s %s\n' "Details" "$(tilde "$SCAN_RESULT_LOG")"
+    [ "$SCAN_RESULT_THREATS" -gt 0 ] && say "  Review with: clamctl threats"
+    return 0
+}
+
+# Quarantine: files are neutralised where they are (renamed, mode 000) so a
+# job holding Full Disk Access never copies protected data anywhere else.
+valid_id() { printf '%s' "$1" | grep -q -E '^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$'; }
+valid_perm() { printf '%s' "$1" | grep -q -E '^[0-7]{1,4}$'; }
+manifest_safe() { case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) return 1 ;; esac; }
+quarantine_target_ok() { case "$1" in *"$QUARANTINE_SUFFIX") [ -n "$1" ] ;; *) return 1 ;; esac; }
+manifest_line() { awk -F'\t' -v id="$1" '$1 == id' "$MANIFEST" 2>/dev/null | head -1; }
+manifest_drop() { awk -F'\t' -v id="$1" '$1 != id' "$MANIFEST" > "$MANIFEST.tmp" && mv -f "$MANIFEST.tmp" "$MANIFEST"; }
+
+quarantine_file() {
+    # $1 path, $2 signature. Prints the quarantine id on success.
+    local path="$1" sig="$2" id perm target
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    manifest_safe "$path" && manifest_safe "$sig" || return 1
+    while :; do
+        id="$(date +%Y%m%d-%H%M%S)-$(printf '%04x' "$RANDOM")"
+        [ -n "$(manifest_line "$id")" ] || break
+    done
+    [ -w "$MANIFEST" ] && [ -w "$QUARANTINE_DIR" ] || return 1
+    perm="$(stat -f %Lp "$path" 2>/dev/null)" && valid_perm "$perm" || return 1
+    target="$path$QUARANTINE_SUFFIX"
+    { [ -e "$target" ] || [ -L "$target" ]; } && target="$path.$id$QUARANTINE_SUFFIX"
+    [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+    mv -n "$path" "$target" 2>/dev/null && [ ! -e "$path" ] || return 1
+    if ! chmod 000 "$target" 2>/dev/null; then
+        mv -n "$target" "$path" 2>/dev/null
+        return 1
+    fi
+    if ! printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$(date '+%Y-%m-%dT%H:%M:%S')" "$sig" "$perm" "$path" "$target" >> "$MANIFEST"; then
+        chmod "$perm" "$target" 2>/dev/null
+        mv -n "$target" "$path" 2>/dev/null
+        return 1
+    fi
+    printf '%s' "$id"
+}
+
+cmd_quarantine() {
+    local sub="${1:-list}" id line perm orig target path tmp failed
+    case "$sub" in
+        add|restore|delete|rm|purge)
+            acquire_lock_wait 30 || die "another scan or quarantine operation is running"
+            trap release_lock EXIT
+            ;;
+    esac
+    case "$sub" in
+        list|ls)
+            if [ ! -s "$MANIFEST" ]; then say "Quarantine is empty."; return 0; fi
+            printf '%-22s %-20s %-36s %s\n' "ID" "DATE" "SIGNATURE" "ORIGINAL PATH"
+            awk -F'\t' '{ printf "%-22s %-20s %-36s %s\n", $1, $2, substr($3, 1, 36), $5 }' "$MANIFEST"
+            say ""
+            say "Files stay next to where they were found, renamed with $QUARANTINE_SUFFIX and made unreadable."
+            ;;
+        add)
+            path="$(abspath "${2:-}")"
+            { [ -n "${2:-}" ] && [ -f "$path" ]; } || die "usage: clamctl quarantine add FILE"
+            id="$(quarantine_file "$path" "manual")" || die "could not quarantine $path"
+            record_threat manual manual "quarantined:$id" "$path"
+            ok "Quarantined as $id"
+            ;;
+        restore)
+            id="${2:-}"; valid_id "$id" || die "usage: clamctl quarantine restore ID"
+            line="$(manifest_line "$id")"
+            [ -n "$line" ] || die "no quarantined file with id $id"
+            perm="$(printf '%s' "$line" | cut -f4)"; orig="$(printf '%s' "$line" | cut -f5)"; target="$(printf '%s' "$line" | cut -f6)"
+            { valid_perm "$perm" && quarantine_target_ok "$target" && [ -n "$orig" ]; } || die "quarantine record for $id is corrupt"
+            { [ -f "$target" ] && [ ! -L "$target" ]; } || die "quarantined file is gone or replaced by a symlink: $target"
+            { [ -e "$orig" ] || [ -L "$orig" ]; } && die "$orig already exists; move it away first"
+            chmod "$perm" "$target" 2>/dev/null || die "could not restore permissions on $target"
+            if ! mv -n "$target" "$orig" || [ -e "$target" ]; then
+                chmod 000 "$target" 2>/dev/null
+                die "could not move the file back"
+            fi
+            manifest_drop "$id" || die "file restored, but could not update quarantine records"
+            log "restored $id to $orig"
+            ok "Restored $orig"
+            warn "the file was flagged by ClamAV; only restore files you trust"
+            ;;
+        delete|rm)
+            id="${2:-}"; valid_id "$id" || die "usage: clamctl quarantine delete ID"
+            line="$(manifest_line "$id")"
+            [ -n "$line" ] || die "no quarantined file with id $id"
+            target="$(printf '%s' "$line" | cut -f6)"
+            quarantine_target_ok "$target" || die "quarantine record for $id is corrupt"
+            rm -f "$target" || die "could not delete $target"
+            manifest_drop "$id" || die "file deleted, but could not update quarantine records"
+            log "deleted quarantined $id ($target)"
+            ok "Deleted $id"
+            ;;
+        purge)
+            [ -f "$MANIFEST" ] || { say "Quarantine is empty."; return 0; }
+            tmp="$MANIFEST.tmp"; failed=""
+            : > "$tmp" || die "could not write $tmp"
+            while IFS= read -r line; do
+                id="$(printf '%s' "$line" | cut -f1)"
+                target="$(printf '%s' "$line" | cut -f6)"
+                if valid_id "$id" && quarantine_target_ok "$target" && rm -f "$target"; then
+                    :
+                else
+                    printf '%s\n' "$line" >> "$tmp" || die "could not preserve quarantine records"
+                    failed=1
+                fi
+            done < "$MANIFEST"
+            mv -f "$tmp" "$MANIFEST" || die "could not update quarantine records"
+            [ -n "$failed" ] && die "some quarantine entries could not be deleted; manifest kept"
+            log "purged quarantine"
+            ok "All quarantined files deleted"
+            ;;
+        *) die "usage: clamctl quarantine [list|add FILE|restore ID|delete ID|purge]" ;;
+    esac
+}
+
+cmd_threats() {
+    local n="${1:-20}"
+    case "$n" in ''|*[!0-9]*) die "usage: clamctl threats [COUNT]" ;; esac
+    if [ ! -s "$THREAT_LOG" ]; then say "No threats recorded."; return 0; fi
+    printf '%-20s %-7s %-34s %-30s %s\n' "DATE" "SCAN" "SIGNATURE" "ACTION" "PATH"
+    tail -n "$n" "$THREAT_LOG" | awk -F'\t' '{ printf "%-20s %-7s %-34s %-30s %s\n", $1, $2, substr($3, 1, 34), $4, $5 }'
+    say ""
+    say "Quarantine a reported file: clamctl quarantine add PATH · restore one: clamctl quarantine restore ID"
+}
+
+ensure_dirs() {
+    mkdir -p "$CLAMCTL_HOME" "$BIN_DIR" "$ETC_DIR" "$RUN_DIR" "$STATE_DIR" "$QUARANTINE_DIR" "$LOG_DIR" "$LAUNCH_AGENTS_DIR" || die "cannot create directories under $CLAMCTL_HOME"
+    chmod 700 "$CLAMCTL_HOME" "$LOG_DIR" || die "cannot protect configuration and log directories"
+    [ -f "$MANIFEST" ] || : > "$MANIFEST"
+    [ -f "$STATE_DIR/installed" ] || state_set installed "time=$(now)"
+}
+
+require_installed() {
+    [ -f "$CONF_FILE" ] || die "clamctl is not installed yet. Run: clamctl install"
+    [ -x "$CLAMSCAN" ] || die "ClamAV not found under $CLAMAV_DIR. Run: clamctl install"
+}
+
+install_script_copy() {
+    if [ "$SELF_PATH" != "$INSTALLED_SCRIPT" ] && ! cmp -s "$SELF_PATH" "$INSTALLED_SCRIPT"; then
+        cp -f "$SELF_PATH" "$INSTALLED_SCRIPT" || die "cannot install to $INSTALLED_SCRIPT"
+        chmod 755 "$INSTALLED_SCRIPT"
+    fi
+}
+
+install_runner() {
+    local backup file old_stamp
+    backup="$(mktemp -d "$BIN_DIR/install.XXXXXX")" || die "cannot prepare installation backup"
+    old_stamp="$(cat "$RUNNER.stamp" 2>/dev/null)"
+    for file in "$INSTALLED_SCRIPT" "$RUNNER" "$RUNNER.stamp"; do
+        if [ -e "$file" ]; then cp -p "$file" "$backup/" || die "cannot back up $file"; fi
+    done
+    if ! ( install_script_copy; build_runner ); then
+        for file in "$INSTALLED_SCRIPT" "$RUNNER" "$RUNNER.stamp"; do
+            if [ -e "$backup/${file##*/}" ]; then
+                mv -f "$backup/${file##*/}" "$file" || die "restore failed; installation backup remains at $backup"
+            else
+                rm -f "$file" || die "cannot remove incomplete installation file: $file"
+            fi
+        done
+        rmdir "$backup"
+        die "helper build failed; previous installation restored"
+    fi
+    rm -rf "$backup"
+    [ "$old_stamp" = "$(cat "$RUNNER.stamp")" ] || RUNNER_REBUILT=1
+}
+
+cmd_install() {
+    local mode="" a cmd_hint="clamctl"
+    for a in "$@"; do
+        case "$a" in
+            --mode=*) mode="${a#--mode=}" ;;
+            light|daemon) mode="$a" ;;
+            *) die "usage: clamctl install [--mode=light|daemon]" ;;
+        esac
+    done
+    [ "$(uname -s)" = Darwin ] || die "clamctl only runs on macOS"
+    detect_brew
+    [ -n "$BREW_PREFIX" ] || die "Homebrew is required: https://brew.sh"
+
+    say "${B}Installing clamctl${N}"
+    if [ ! -x "$BREW_PREFIX/opt/clamav/bin/clamscan" ]; then
+        say "Installing ClamAV with Homebrew..."
+        brew install clamav || die "brew install clamav failed"
+    fi
+    ensure_dirs
+    if [ ! -f "$CONF_FILE" ]; then
+        default_config > "$CONF_FILE"
+        ok "Wrote default configuration to $(tilde "$CONF_FILE")"
+    fi
+    [ -n "$mode" ] && config_set MODE "$mode"
+    load_config
+    [ -w "$DATABASE_DIR" ] || die "$DATABASE_DIR is not writable; fix ownership or set DATABASE_DIR in $(tilde "$CONF_FILE")"
+
+    install_runner
+    ok "Helper binary ready: $(tilde "$RUNNER")"
+    if [ -z "${CLAMCTL_NO_SYMLINK:-}" ] && [ -w "$BREW_PREFIX/bin" ] && { [ ! -e "$BREW_PREFIX/bin/clamctl" ] || [ -L "$BREW_PREFIX/bin/clamctl" ]; }; then
+        ln -sf "$INSTALLED_SCRIPT" "$BREW_PREFIX/bin/clamctl"
+        ok "Command available as: clamctl"
+    else
+        cmd_hint="$(tilde "$INSTALLED_SCRIPT")"
+        note "Run it as $cmd_hint, or add $(tilde "$BIN_DIR") to your PATH"
+    fi
+
+    apply_configuration || die "could not write ClamAV configuration"
+    if ! db_present; then
+        say ""
+        say "Downloading signature databases (about 300 MB, a few minutes)..."
+        cmd_update || warn "signature download failed; run '$cmd_hint update' later"
+    fi
+    apply_agents || die "could not load background jobs; run: clamctl doctor"
+    ok "Background jobs installed: updates every ${UPDATE_INTERVAL_HOURS} h, scans daily at $(printf '%02d:%02d' "$SCAN_HOUR" "$SCAN_MINUTE"), watching $(for a in "${WATCH_DIRS[@]}"; do tilde "$a"; printf ' '; done | sed 's/ $//')"
+    say ""
+    if [ "$LAUNCHCTL" = /bin/launchctl ]; then
+        cmd_doctor --after-install || true
+    fi
+    say ""
+    say "${B}Next:${N} $cmd_hint status · $cmd_hint scan --quick · $cmd_hint help"
+}
+
+apply_configuration() {
+    write_freshclam_conf || return 1
+    write_clamd_conf "$ETC_DIR/clamd.conf"
+}
+
+apply_agents() {
+    write_plist_update && agent_load update || return 1
+    write_plist_scan && agent_load scan || return 1
+    if [ "$MODE" = daemon ]; then
+        write_plist_clamd && agent_load clamd || return 1
+        if [ "$LAUNCHCTL" = /bin/launchctl ]; then
+            clamd_wait 60 || warn "clamd did not start within 60 s; check: clamctl log clamd"
+        fi
+    else
+        agent_unload clamd
+    fi
+    if [ "${#WATCH_DIRS[@]}" -gt 0 ]; then
+        write_plist_watch && agent_load watch || return 1
+    else
+        agent_unload watch
+    fi
+}
+
+cmd_apply() {
+    require_installed
+    ensure_dirs
+    install_runner
+    apply_configuration || die "could not write ClamAV configuration"
+    apply_agents || die "could not load background jobs; run: clamctl doctor"
+    if [ -n "${RUNNER_REBUILT:-}" ]; then
+        if [ -n "$CODESIGN_IDENTITY" ]; then
+            ok "Helper binary rebuilt and signed with '$CODESIGN_IDENTITY'; existing permission grants stay valid"
+        else
+            note "The helper binary was rebuilt. macOS will ask again for folder access, and Full Disk Access (if granted) must be removed and re-added: clamctl fda. Set CODESIGN_IDENTITY to avoid this (see README)."
+        fi
+    fi
+    ok "Configuration applied (mode: $MODE)"
+}
+
+cmd_uninstall() {
+    local purge="" a
+    case "${1:-}" in '') ;; --purge) purge=1 ;; *) die "usage: clamctl uninstall [--purge]" ;; esac
+    if [ -n "$purge" ] && [ -s "$MANIFEST" ]; then
+        die "quarantine is not empty; restore or delete entries before uninstall --purge"
+    fi
+    if [ -n "$purge" ]; then
+        validate_purge_dir "$CLAMCTL_HOME"
+        validate_purge_dir "$LOG_DIR"
+        if [ -d "$CLAMCTL_HOME" ] && { [ ! -f "$CONF_FILE" ] || [ ! -f "$INSTALLED_SCRIPT" ]; }; then
+            die "refusing to purge a directory without an installed clamctl copy"
+        fi
+    fi
+    for a in update scan watch clamd probe; do agent_unload "$a"; done
+    detect_brew
+    if [ -n "$BREW_PREFIX" ] && [ -L "$BREW_PREFIX/bin/clamctl" ] && [ "$(readlink "$BREW_PREFIX/bin/clamctl")" = "$INSTALLED_SCRIPT" ]; then
+        rm -f "$BREW_PREFIX/bin/clamctl"
+    fi
+    if [ -n "$purge" ]; then
+        rm -rf "$CLAMCTL_HOME" "$LOG_DIR" || die "could not remove configuration or logs"
+        ok "Removed background jobs, $(tilde "$CLAMCTL_HOME") and logs"
+    else
+        ok "Removed background jobs. Configuration, quarantine records and logs kept in $(tilde "$CLAMCTL_HOME")"
+        say "  Remove everything with: clamctl uninstall --purge"
+    fi
+    say "  Quarantined files stay in place (renamed $QUARANTINE_SUFFIX); ClamAV itself stays installed: brew uninstall clamav"
+}
+
+validate_purge_dir() {
+    local p="${1%/}"
+    case "$p" in /*) ;; *) die "purge requires absolute directories" ;; esac
+    case "$p/" in */../*|*/./*) die "refusing to purge a path containing dot components" ;; esac
+    [ ! -L "$p" ] || die "refusing to purge a symlink: $p"
+    if [ -d "$p" ]; then p="$(cd "$p" && pwd -P)" || return 1; fi
+    case "$p" in ''|/|/System|/Library|/usr|/bin|/sbin|/opt|/private|/private/tmp|/tmp|/Volumes) die "refusing to purge system directory: $p" ;; esac
+    case "$HOME/" in "$p/"*) die "refusing to purge the home directory or its parent" ;; esac
+}
+
+cmd_update() {
+    local scheduled="" rc fails
+    [ "${1:-}" = "--scheduled" ] && scheduled=1
+    require_installed
+    [ -f "$ETC_DIR/freshclam.conf" ] || apply_configuration || return 1
+    rotate_logs
+    if [ -n "$scheduled" ]; then
+        /usr/sbin/taskpolicy -b "$FRESHCLAM" --config-file="$ETC_DIR/freshclam.conf" --quiet >/dev/null 2>&1
+        rc=$?
+    else
+        "$FRESHCLAM" --config-file="$ETC_DIR/freshclam.conf" --show-progress 2>&1 | grep -v -E '^$|ClamAV update process started|^Current working dir'
+        rc="${PIPESTATUS[0]}"
+    fi
+    if [ "$rc" = 0 ]; then
+        state_set last_update "time=$(now)" "status=ok" "failures=0"
+        log "signature update ok"
+        [ -z "$scheduled" ] && ok "Signatures are up to date (daily $(db_version_of daily 2>/dev/null))"
+        engine_outdated && note "freshclam reports that ClamAV itself is outdated; run: brew upgrade clamav"
+        return 0
+    fi
+    fails="$(state_get last_update failures)"; fails=$(( ${fails:-0} + 1 ))
+    state_set last_update "time=$(state_get last_update time)" "status=failed" "failures=$fails" "lastfail=$(now)"
+    log "signature update failed (exit $rc, $fails in a row)"
+    if [ -n "$scheduled" ]; then
+        [ "$fails" -eq 3 ] && notify "Signature updates failing" "Three attempts in a row. See: clamctl log freshclam"
+    else
+        bad "Update failed (freshclam exit $rc). See: clamctl log freshclam"
+    fi
+    return 1
+}
+
+full_scan_due() {
+    local last; last="$(state_get last_full time)"
+    case "$last" in ''|*[!0-9]*) return 0 ;; esac
+    case "$(state_get last_full status)" in clean|threats) ;; *) return 0 ;; esac
+    [ $(( $(now) - last )) -ge $((FULL_SCAN_EVERY_DAYS * 86400)) ]
+}
+
+cmd_scan() {
+    local kind=manual action="" background="" a paths=() rc auto="" forced="" normal="" stop=""
+    PRIORITY=normal
+    for a in "$@"; do
+        case "$a" in
+            --quick) kind=quick ;;
+            --full) kind=full ;;
+            --auto) auto=1; kind=auto ;;
+            --background) background=1 ;;
+            --stop) stop=1 ;;
+            --report-only) action=report ;;
+            --quarantine) action=quarantine ;;
+            --low) PRIORITY=low ;;
+            --normal) PRIORITY=normal; normal=1 ;;
+            --*) die "unknown option $a (see clamctl help)" ;;
+            *) paths+=("$(abspath "$a")") ;;
+        esac
+    done
+    require_installed
+    if [ -n "$stop" ]; then stop_scan; return $?; fi
+    db_present || die "no signature database yet; run: clamctl update"
+
+    if [ -n "$background" ]; then
+        case "$kind" in quick|full) ;; *) die "--background works with --quick or --full" ;; esac
+        { [ -z "$auto$action$normal" ] && [ "${#paths[@]}" -eq 0 ]; } || die "--background uses configured actions and low priority; omit action overrides, --normal and paths"
+        scan_running && die "a scan is already running (pid $(cat "$RUN_DIR/scan.lock/pid" 2>/dev/null))"
+        [ "$kind" = full ] && : > "$STATE_DIR/force_full"
+        [ "$kind" = quick ] && : > "$STATE_DIR/force_quick"
+        "$LAUNCHCTL" kickstart "$DOMAIN/$(label_of scan)" 2>/dev/null || die "could not start the scan job; is clamctl installed?"
+        ok "$kind scan started in the background at low priority. Follow with: clamctl log -f"
+        return 0
+    fi
+
+    ensure_runner_context scan "$@"
+    if [ -n "$auto" ]; then
+        PRIORITY=low
+        if is_paused; then log "scheduled scan skipped: paused"; return 0; fi
+        if [ -f "$STATE_DIR/force_full" ]; then
+            kind=full; forced=full
+        elif [ -f "$STATE_DIR/force_quick" ]; then
+            kind=quick; forced=quick
+        elif full_scan_due; then
+            if [ "$FULL_SCAN_ON_BATTERY" = yes ] || ! on_battery; then kind=full
+            else kind=quick; log "full scan due but on battery; running quick scan instead"; fi
+        else
+            kind=quick
+        fi
+    fi
+
+    case "$kind" in
+        quick) paths=(); for a in "${QUICK_SCAN_PATHS[@]}"; do [ -e "$a" ] && paths+=("$a"); done ;;
+        full) paths=("${FULL_SCAN_PATHS[@]}") ;;
+        manual) [ "${#paths[@]}" -gt 0 ] || die "usage: clamctl scan PATH... | --quick | --full" ;;
+    esac
+    [ "${#paths[@]}" -gt 0 ] || die "nothing to scan"
+    if [ -z "$action" ]; then
+        if [ "$kind" = full ]; then action="$FULL_SCAN_ACTION"; else action="$ACTION"; fi
+    fi
+
+    acquire_lock_wait 60 || die "another scan is already running (pid $(cat "$RUN_DIR/scan.lock/pid" 2>/dev/null))"
+    trap release_lock EXIT
+    case "$forced" in
+        full) rm -f "$STATE_DIR/force_full" "$STATE_DIR/force_quick" ;;
+        quick) rm -f "$STATE_DIR/force_quick" ;;
+    esac
+
+    if [ -z "$auto" ]; then
+        say "${B}Scanning${N} ($kind, $MODE mode, $PRIORITY priority, $action): ${paths[*]}"
+        [ "$MODE" = light ] && say "${D}Loading signatures first takes about half a minute.${N}"
+    fi
+    scan_paths "$kind" "$action" "${paths[@]}"
+    rc=$?
+    release_lock
+    [ -z "$auto" ] && print_scan_summary
+    return $rc
+}
+
+watch_candidates() {
+    # Directory exclusions must be pruned before stat or scanner reads can hydrate cloud files.
+    local d re young unsupported="$RUN_DIR/watch.unsupported.$$" prune=(-name '*.download') eligible
+    while IFS= read -r re; do
+        case "$re" in
+            ^*) prune+=(-o -regex "$re.*") ;;
+            *) prune+=(-o -regex ".*$re.*") ;;
+        esac
+    done < <(exclude_regexes)
+    [ "${#FIND_DATALESS[@]}" -eq 0 ] || prune+=(-o -flags +dataless)
+    eligible=(-type f ! -name .DS_Store ! -name '*.crdownload' ! -name '*.part' ! -name '*.partial'
+              ! -name '*.download' ! -name '*.tmp' ! -name '.*.icloud' ! -name "*$QUARANTINE_SUFFIX"
+              "${FIND_DATALESS[@]}")
+    rm -f "$unsupported"
+    WATCH_YOUNG=0
+    for d in "${WATCH_DIRS[@]}"; do
+        [ -d "$d" ] || continue
+        if ! find -E -f "$d" -- -type d \( "${prune[@]}" \) -prune -o "${eligible[@]}" \
+            \( \( -path "*"$'\n'"*" -o -path "*"$'\r'"*" -o -path "*"$'\t'"*" \) -exec touch "$unsupported" \; \
+                -o ! -mtime -3s -exec stat -f '%z:%m|%N' {} + \) 2>> "$LOG_DIR/scan-watch.log"; then
+            rm -f "$unsupported"
+            return 2
+        fi
+        if [ -f "$unsupported" ]; then
+            rm -f "$unsupported"
+            log "watch: filenames containing tabs or newlines cannot be scanned through a file list; rename them before retrying"
+            return 2
+        fi
+        young="$(find -E -f "$d" -- -type d \( "${prune[@]}" \) -prune -o "${eligible[@]}" \
+            -mtime -3s -print 2>> "$LOG_DIR/scan-watch.log" | wc -l)" || return 2
+        WATCH_YOUNG=$((WATCH_YOUNG + young))
+    done
+    return 0
+}
+
+cmd_scan_new() {
+    # The pre-scan snapshot lets changed or quarantined files be reconsidered on the next run.
+    local tmpkeys tmpnew tmplist count rc=0 round=0
+    PRIORITY=low
+    require_installed
+    db_present || { log "watch: no database yet"; return 0; }
+    if is_paused; then log "watch: paused"; return 0; fi
+    ensure_runner_context scan-new "$@"
+    if daily_scan_overdue && ! scan_running; then
+        # launchd skips a calendar run the Mac was powered off for; this periodic job catches it up.
+        log "daily scan was missed; starting it now"
+        "$LAUNCHCTL" kickstart "$DOMAIN/$(label_of scan)" >/dev/null 2>&1
+    fi
+    LOCK_KICK_WATCH=no
+    if ! acquire_lock; then
+        : > "$STATE_DIR/watch.pending"
+        log "watch: another scan is running; the folders are checked again when it finishes"
+        return 0
+    fi
+    trap release_lock EXIT
+    rotate_logs
+    sleep 3
+    tmpkeys="$RUN_DIR/watch.keys.$$"; tmpnew="$RUN_DIR/watch.new.$$"; tmplist="$RUN_DIR/watch.list.$$"
+    while [ $round -lt 5 ]; do
+        round=$((round + 1)); rc=0; count=0
+        if ! watch_candidates > "$tmpkeys"; then
+            log "watch: could not enumerate eligible files; files will be retried (see scan-watch.log)"
+            state_set last_watch "time=$(now)" "status=failed" "scanned=0" "threats=0"
+            rc=2; break
+        fi
+        if [ -f "$LEDGER" ]; then
+            grep -v -x -F -f "$LEDGER" "$tmpkeys" > "$tmpnew"; rc=$?
+            if [ "$rc" -gt 1 ]; then rc=2; break; fi
+        else
+            cp "$tmpkeys" "$tmpnew" || { rc=2; break; }
+        fi
+        rc=0
+        count="$(grep -c . "$tmpnew")"
+        if [ "$count" -gt 0 ]; then
+            cut -d'|' -f2- "$tmpnew" > "$tmplist" || { rc=2; break; }
+            log "watch: $count new file(s)"
+            scan_paths watch "$ACTION" --file-list="$tmplist" "${WATCH_DIRS[@]}"; rc=$?
+        fi
+        if [ "$rc" = 2 ]; then
+            log "watch: scan did not complete; files will be retried"
+            break
+        fi
+        mv -f "$tmpkeys" "$LEDGER" || { rc=2; break; }
+        # launchd drops folder changes that happen while this job runs, so list again after every scan.
+        if [ "$WATCH_YOUNG" -gt 0 ]; then sleep 4
+        elif [ "$count" -eq 0 ]; then break; fi
+    done
+    rm -f "$tmpkeys" "$tmpnew" "$tmplist"
+    release_lock
+    [ "$rc" = 2 ] && return 2
+    return 0
+}
+
+cmd_status() {
+    require_installed
+    local daily main age last next paused count kind st t label d info
+    say "${B}clamctl $CLAMCTL_VERSION${N} · ClamAV $("$CLAMSCAN" --version 2>/dev/null | sed -n 's/^ClamAV \([^/]*\).*/\1/p') · mode: ${B}$MODE${N}"
+    if info="$(running_scan)"; then
+        note "Running now: ${info%% *} scan since $(fmt_time "$(printf '%s' "$info" | cut -d' ' -f2)") (stop with: clamctl scan --stop)"
+    fi
+    if is_paused; then
+        paused="$(paused_until)"
+        if [ "$paused" = forever ]; then note "Scans paused until you run: clamctl resume"
+        else note "Scans paused until $(fmt_time "$paused")"; fi
+    fi
+    if db_present; then
+        daily="$(db_version_of daily)"; main="$(db_version_of main)"; age="$(db_mtime)"
+        printf '  %-14s daily %s, main %s (updated %s ago)\n' "Signatures" "${daily:-?}" "${main:-?}" "$(fmt_age "${age:-0}")"
+    else
+        bad "No signature database. Run: clamctl update"
+    fi
+    last="$(state_get last_update time)"; st="$(state_get last_update status)"
+    if [ -n "$last" ]; then
+        printf '  %-14s every %s h · last %s %s' "Updates" "$UPDATE_INTERVAL_HOURS" "$(fmt_time "$last")" "${st:-ok}"
+    else
+        printf '  %-14s every %s h · not run yet' "Updates" "$UPDATE_INTERVAL_HOURS"
+    fi
+    if agent_loaded update; then printf ' · job loaded\n'; else printf ' · %sjob not loaded%s\n' "$R" "$N"; fi
+    engine_outdated && note "ClamAV itself is outdated: brew upgrade clamav"
+
+    if [ "$MODE" = daemon ]; then
+        if clamd_alive; then printf '  %-14s running' "clamd"; else printf '  %-14s %snot running%s' "clamd" "$R" "$N"; fi
+        if agent_loaded clamd; then printf ' · job loaded\n'; else printf ' · job not loaded\n'; fi
+    fi
+
+    printf '  %-14s %s' "Watching" "$(for d in "${WATCH_DIRS[@]}"; do tilde "$d"; printf ' '; done)"
+    if agent_loaded watch; then printf '· job loaded'; else printf '· %sjob not loaded%s' "$R" "$N"; fi
+    t="$(state_get last_watch time)"
+    [ -n "$t" ] && printf ' · last check %s' "$(fmt_time "$t")"
+    printf '\n'
+
+    for kind in quick full; do
+        t="$(state_get "last_$kind" time)"
+        if [ "$kind" = quick ]; then label="Quick scan"; else label="Full scan"; fi
+        if [ -n "$t" ]; then
+            st="$(state_get "last_$kind" status)"
+            printf '  %-14s last %s: %s, %s files in %s' "$label" "$(fmt_time "$t")" "$st" "$(state_get "last_$kind" scanned)" "$(fmt_duration "$(state_get "last_$kind" duration)")"
+            d="$(state_get "last_$kind" denied)"
+            [ -n "$d" ] && [ "$d" != 0 ] && printf ' · %ssome locations not permitted (clamctl fda)%s' "$Y" "$N"
+            printf '\n'
+        else
+            printf '  %-14s not run yet\n' "$label"
+        fi
+    done
+    if full_scan_due; then next="due at the next scheduled run"; else next="due $(fmt_time $(( $(state_get last_full time) + FULL_SCAN_EVERY_DAYS * 86400 )))"; fi
+    printf '  %-14s daily at %02d:%02d · full scan every %s days, %s' "Schedule" "$SCAN_HOUR" "$SCAN_MINUTE" "$FULL_SCAN_EVERY_DAYS" "$next"
+    if agent_loaded scan; then printf ' · job loaded\n'; else printf ' · %sjob not loaded%s\n' "$R" "$N"; fi
+
+    count="$(grep -c . "$MANIFEST" 2>/dev/null)"
+    printf '  %-14s %s file(s)' "Quarantine" "${count:-0}"
+    [ -s "$THREAT_LOG" ] && printf ' · %s detections logged (clamctl threats)' "$(grep -c . "$THREAT_LOG")"
+    printf '\n'
+}
+
+probe_write() {
+    # Runs inside the launchd job and records which protected folders are readable.
+    local out="$1" d name
+    [ "$out" = "$STATE_DIR/probe.result" ] || die "invalid probe output path"
+    {
+        for d in Downloads Desktop Documents Library/Mail Library/Safari Library/Messages; do
+            name="${d##*/}"
+            if [ ! -e "$HOME/$d" ]; then printf '%s=missing\n' "$name"
+            elif ls "$HOME/$d" >/dev/null 2>&1; then printf '%s=ok\n' "$name"
+            else printf '%s=denied\n' "$name"; fi
+        done
+    } > "$out.tmp" && mv -f "$out.tmp" "$out"
+}
+
+run_probe() {
+    # Loads a one-shot agent that runs probe_write through the helper. Prompts for
+    # Downloads, Desktop and Documents appear here the first time.
+    local result="$STATE_DIR/probe.result" i=0
+    rm -f "$result"
+    {
+        plist_open probe
+        plist_runner_args probe "$result"
+        printf '    <key>RunAtLoad</key><true/>\n'
+        plist_common_block probe
+        plist_close
+    } > "$(plist_path probe)"
+    agent_load probe || return 1
+    while [ $i -lt 90 ] && [ ! -f "$result" ]; do sleep 1; i=$((i + 1)); done
+    agent_unload probe
+    [ -f "$result" ]
+}
+
+cmd_doctor() {
+    local after="" noprobe="" a v st r problems=0 d
+    for a in "$@"; do case "$a" in --after-install) after=1 ;; --no-probe) noprobe=1 ;; esac; done
+    [ -n "${CLAMCTL_NO_PROBE:-}" ] && noprobe=1
+    say "${B}clamctl doctor${N}"
+    detect_brew
+    if [ -n "$BREW_PREFIX" ]; then ok "Homebrew at $BREW_PREFIX"; else bad "Homebrew not found"; problems=1; fi
+    if [ -x "$CLAMSCAN" ]; then ok "ClamAV $("$CLAMSCAN" --version 2>/dev/null | sed -n 's/^ClamAV \([^/]*\).*/\1/p') at $(tilde "$CLAMAV_DIR")"; else bad "ClamAV not installed (clamctl install)"; problems=1; fi
+    if [ -f "$CONF_FILE" ]; then ok "Configuration $(tilde "$CONF_FILE") (mode $MODE)"; else bad "Not installed (clamctl install)"; return 1; fi
+    if [ -x "$RUNNER" ] && [ "$(cat "$RUNNER.stamp" 2>/dev/null)" = "$(runner_stamp)" ]; then
+        ok "Helper binary $(tilde "$RUNNER") matches the installed script"
+        if runner_signed; then ok "Helper is signed with a stable identity, so permission grants survive updates"
+        else note "Helper is ad-hoc signed: macOS forgets its permissions whenever clamctl is updated (set CODESIGN_IDENTITY, see README)"; fi
+    elif [ -x "$RUNNER" ]; then bad "Helper binary is out of date (clamctl apply)"; problems=1
+    else bad "Helper binary missing (clamctl apply)"; problems=1; fi
+    if db_present; then
+        v="$(db_mtime)"
+        if [ $(( $(now) - v )) -gt 604800 ]; then bad "Signatures are $(fmt_age "$v") old (clamctl update)"; problems=1
+        else ok "Signatures updated $(fmt_age "$v") ago (daily $(db_version_of daily))"; fi
+    else
+        bad "No signature database (clamctl update)"; problems=1
+    fi
+    engine_outdated && note "freshclam reports that ClamAV itself is outdated: brew upgrade clamav"
+    for a in update scan watch; do
+        [ "$a" = watch ] && [ "${#WATCH_DIRS[@]}" -eq 0 ] && continue
+        if agent_loaded "$a"; then
+            r="$(agent_last_exit "$a")"
+            # Scan jobs exit 1 when they found threats; only higher codes are failures.
+            if [ -n "$r" ] && [ "$r" != 0 ] && [ "$r" != 1 ] && [ "$r" != "(never exited)" ]; then bad "Job $(label_of "$a") loaded, last run failed with exit code $r (clamctl log)"; problems=1
+            elif [ "$r" = 1 ] && [ "$a" != update ]; then ok "Job $(label_of "$a") loaded, last run found threats (clamctl threats)"
+            elif [ "$r" = 1 ]; then bad "Job $(label_of "$a") loaded, last update failed (clamctl log freshclam)"; problems=1
+            else ok "Job $(label_of "$a") loaded"; fi
+        else
+            bad "Job $(label_of "$a") not loaded (clamctl apply)"; problems=1
+        fi
+    done
+    if [ "$MODE" = daemon ]; then
+        if clamd_alive; then ok "clamd is running"; else bad "clamd is not responding (clamctl start, then clamctl log clamd)"; problems=1; fi
+    fi
+    is_paused && note "Scans are paused (clamctl resume)"
+    if [ -z "$noprobe" ] && [ "$LAUNCHCTL" = /bin/launchctl ] && [ -x "$RUNNER" ]; then
+        say "Checking folder access from the background job (answer any permission dialogs that appear)..."
+        if run_probe; then
+            for d in Downloads Desktop Documents; do
+                st="$(state_get probe.result "$d")"
+                case "$st" in
+                    ok) ok "$d readable by the background job" ;;
+                    denied) bad "$d not readable: allow clamctl-agent under System Settings › Privacy & Security › Files and Folders (or grant Full Disk Access)"; problems=1 ;;
+                esac
+            done
+            r=""
+            for d in Mail Safari Messages; do
+                st="$(state_get probe.result "$d")"
+                [ "$st" = denied ] && r="denied"
+                [ "$st" = ok ] && [ "$r" != denied ] && r="ok"
+            done
+            case "$r" in
+                ok) ok "Full Disk Access granted (Mail, Safari and Messages data can be scanned)" ;;
+                denied) note "Full Disk Access not granted: full scans skip Mail, Safari, Messages and Time Machine data. Fix with: clamctl fda" ;;
+                *) note "Full Disk Access could not be determined" ;;
+            esac
+        else
+            bad "The background job did not report back within 90 s (clamctl log launchd-probe)"; problems=1
+        fi
+    fi
+    if [ -n "$after" ]; then
+        note "Notifications come from 'Script Editor'; allow them in System Settings › Notifications if you do not see any."
+    fi
+    [ "$problems" = 0 ] && ok "No problems found" || return 1
+}
+
+cmd_fda() {
+    require_installed
+    say "Full Disk Access lets full scans read Mail, Safari, Messages and Time Machine data."
+    say "It is granted to the small helper that runs the background jobs:"
+    say "  $RUNNER"
+    say ""
+    say "1. System Settings opens on Privacy & Security › Full Disk Access."
+    say "2. Click +, press ⌘⇧G, paste the path above and choose clamctl-agent."
+    say "3. Re-run: clamctl doctor"
+    if runner_signed; then
+        say "The helper is code-signed, so the entry survives clamctl updates."
+    else
+        say "After clamctl itself is updated (clamctl apply), remove and re-add the entry, or set CODESIGN_IDENTITY (see README) so it survives."
+    fi
+    say "For scans you start from the Terminal, grant Full Disk Access to Terminal instead (or use --background)."
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
+    open -R "$RUNNER" 2>/dev/null
+}
+
+cmd_mode() {
+    require_installed
+    case "${1:-}" in
+        "") say "$MODE"; return 0 ;;
+        light|daemon) ;;
+        *) die "usage: clamctl mode [light|daemon]" ;;
+    esac
+    [ "$1" = "$MODE" ] && { say "already in $1 mode"; return 0; }
+    config_set MODE "$1"
+    load_config
+    cmd_apply || return 1
+    [ "$MODE" = light ] && ok "clamd stopped; scans now load signatures on demand"
+    return 0
+}
+
+cmd_pause() {
+    require_installed
+    local arg="${1:-}" secs="" until amount multiplier=60
+    case "$arg" in
+        "") state_set pause "until=forever"; ok "Scans paused until: clamctl resume" ;;
+        off) cmd_resume; return $? ;;
+        *)
+            case "$arg" in *h) amount="${arg%h}"; multiplier=3600 ;; *m) amount="${arg%m}" ;; *) amount="$arg" ;; esac
+            case "$amount" in ''|*[!0-9]*) die "usage: clamctl pause [MINUTES|2h|off]" ;; esac
+            check_int amount 0 525600
+            secs=$((amount * multiplier))
+            ;;
+    esac
+    if [ -n "$secs" ]; then
+        until=$(( $(now) + secs ))
+        state_set pause "until=$until"
+        ok "Scheduled and watched-folder scans paused until $(fmt_time "$until")"
+    fi
+    log "paused: $(paused_until)"
+}
+
+cmd_resume() {
+    rm -f "$STATE_DIR/pause"
+    log "resumed"
+    ok "Scans resumed"
+}
+
+cmd_start() {
+    require_installed
+    [ "$MODE" = daemon ] || die "clamd is only used in daemon mode (clamctl mode daemon)"
+    if ! write_plist_clamd || ! agent_load clamd; then die "could not load clamd"; fi
+    clamd_wait 60 || die "clamd did not start; see: clamctl log clamd"
+    ok "clamd is running"
+}
+cmd_stop() {
+    require_installed
+    agent_unload clamd
+    ok "clamd stopped (it starts again at login or with clamctl start)"
+}
+
+# shellcheck disable=SC2012
+newest_scan_log() { ls -t "$LOG_DIR"/scan-*.log 2>/dev/null | head -1; }
+
+cmd_log() {
+    local name=clamctl follow="" a f
+    for a in "$@"; do case "$a" in -f|--follow) follow=1 ;; *) name="$a" ;; esac; done
+    case "$name" in *[!a-z-]*) die "usage: clamctl log [clamctl|freshclam|clamd|scan|scan-KIND|launchd-JOB] [-f]" ;; esac
+    case "$name" in
+        clamctl|freshclam|clamd) f="$LOG_DIR/$name.log" ;;
+        scan) f="$(newest_scan_log)" ;;
+        scan-*|launchd-*) f="$LOG_DIR/$name.log" ;;
+        *) die "usage: clamctl log [clamctl|freshclam|clamd|scan|scan-KIND|launchd-JOB] [-f]" ;;
+    esac
+    { [ -n "$f" ] && [ -f "$f" ]; } || die "no log yet for $name (logs live in $(tilde "$LOG_DIR"))"
+    if [ -n "$follow" ]; then tail -n 30 -f "$f"; else tail -n 40 "$f"; fi
+}
+
+cmd_config() {
+    require_installed
+    case "${1:-}" in
+        path) say "$CONF_FILE" ;;
+        edit) "${EDITOR:-vi}" "$CONF_FILE" && cmd_apply ;;
+        *) cat "$CONF_FILE" ;;
+    esac
+}
+
+cmd_help() {
+cat <<EOF
+${B}clamctl${N} $CLAMCTL_VERSION - ClamAV on macOS, quietly
+
+  clamctl install [--mode=light|daemon]   install ClamAV, config and background jobs
+  clamctl status                          what is running, signature age, last scans
+  clamctl doctor                          check jobs, signatures and folder permissions
+  clamctl scan PATH...                    scan now (utility priority; add --low to hide it fully)
+  clamctl scan --quick | --full           run the daily or full scan now; --background runs it
+                                          through the low-priority job instead of the Terminal
+  clamctl update                          fetch signatures now
+  clamctl threats [N]                     recent detections and what was done
+  clamctl quarantine [list|add FILE|restore ID|delete ID|purge]
+  clamctl pause [MINUTES|2h] | resume     pause scheduled and watched-folder scans
+  clamctl mode [light|daemon]             show or switch engine mode
+  clamctl start | stop                    control clamd (daemon mode)
+  clamctl log [clamctl|freshclam|clamd|scan] [-f]
+  clamctl fda                             help granting Full Disk Access to the helper
+  clamctl config [edit|path]              show or edit configuration, then apply
+  clamctl apply                           re-generate configs and reload jobs after edits
+  clamctl uninstall [--purge]             remove jobs (and optionally data)
+
+Options for scan: --report-only, --quarantine, --low, --normal, --background, --stop (abort a running scan)
+Config: $(tilde "$CONF_FILE")   Logs: $(tilde "$LOG_DIR")
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        install) cmd_install "$@"; exit $? ;;
+        uninstall) cmd_uninstall "$@"; exit $? ;;
+        help|-h|--help) detect_brew; cmd_help; exit 0 ;;
+        version|--version) say "clamctl $CLAMCTL_VERSION"; exit 0 ;;
+    esac
+    load_config
+    FIND_DATALESS=()
+    find /dev/null -flags +dataless >/dev/null 2>&1 && FIND_DATALESS=(! -flags +dataless)
+    case "$cmd" in
+        status) cmd_status "$@" ;;
+        doctor) cmd_doctor "$@" ;;
+        scan) cmd_scan "$@" ;;
+        scan-new) cmd_scan_new "$@" ;;
+        update) cmd_update "$@" ;;
+        threats) cmd_threats "$@" ;;
+        quarantine|q) cmd_quarantine "$@" ;;
+        pause) cmd_pause "$@" ;;
+        resume) cmd_resume "$@" ;;
+        mode) cmd_mode "$@" ;;
+        start) cmd_start ;;
+        stop) cmd_stop ;;
+        restart) cmd_stop; cmd_start ;;
+        log|logs) cmd_log "$@" ;;
+        fda) cmd_fda ;;
+        config) cmd_config "$@" ;;
+        apply|reload) cmd_apply ;;
+        probe) probe_write "$1" ;;
+        *) die "unknown command '$cmd' (see clamctl help)" ;;
+    esac
+}
+
+main "$@"
