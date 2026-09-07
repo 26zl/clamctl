@@ -5,7 +5,7 @@
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-lightgrey.svg)](#requirements)
 [![Apple Silicon and Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%7C%20Intel-lightgrey.svg)](#requirements)
 [![No root required](https://img.shields.io/badge/root-not%20required-success.svg)](#how-it-works)
-[![ClamAV 1.5](https://img.shields.io/badge/ClamAV-1.5-orange.svg)](https://www.clamav.net/)
+[![ClamAV 1.5.x via Homebrew](https://img.shields.io/badge/ClamAV-1.5.x%20via%20Homebrew-orange.svg)](https://www.clamav.net/)
 
 ClamAV on macOS from one command, without slowing your Mac down.
 
