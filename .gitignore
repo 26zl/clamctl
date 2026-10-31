@@ -1,0 +1,16 @@
+# Runtime data lives in ~/.clamctl and ~/Library/Logs/clamctl, outside the clone.
+# A clone scanned with ACTION=quarantine gets detections renamed in place.
+*.clamctl-quarantined
+
+# Logs and test output redirected into the working tree
+*.log
+
+# macOS
+.DS_Store
+._*
+
+# Editors
+*.swp
+*~
+.idea/
+.vscode/
